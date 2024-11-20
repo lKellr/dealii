@@ -156,11 +156,129 @@ namespace Step95
                         dst,
                         src,
                         true);
+      std::cout << "vmult ||u||^2 = " << dst.norm_sqr() <<  std::endl;
     }
 
-    void rhs(VectorType &rhs, const Function<dim> &rhs_function)
+    void rhs(VectorType &rhs, const Function<dim> &rhs_function, const Function<dim> &boundary_condition)
     {
-      // TODO
+      // Note: boundary condition function added
+      // loop over cells
+      const std::function<void(
+        const MatrixFree<dim, Number, VectorizedArrayType> &,
+        VectorType &, const VectorType &,
+        const std::pair< unsigned int, unsigned int > &)>
+      cell_op = [&](
+              const MatrixFree<dim,Number, VectorizedArrayType> &,
+              VectorType &dst,
+              const VectorType &,
+              const std::pair<unsigned int, unsigned int> &cell_range)
+      {
+
+        CellIntegrator evaluator(*matrix_free, dof_index, quad_index);
+
+        const auto cell_range_category =
+          matrix_free->get_cell_range_category(cell_range);
+
+        std::cout << "applying rhs; cell range: " << cell_range.first << ", " << cell_range.second << "; category "
+         << cell_range_category << "; ||RHS||^2 before = " << rhs.norm_sqr() << std::endl;
+
+        if (is_inside(cell_range_category))
+        {
+          for (unsigned int cell_batch_index = cell_range.first;
+              cell_batch_index < cell_range.second;
+              ++cell_batch_index)
+          {
+            evaluator.reinit(cell_batch_index); 
+
+            for (unsigned int q : evaluator.quadrature_point_indices())
+            {
+              const auto q_points = evaluator.quadrature_point(q);
+              VectorizedArrayType rhs_values = 0.;
+              for (unsigned int v = 0; v < matrix_free->n_active_entries_per_cell_batch(cell_batch_index); ++v)
+                {
+                  Point<dim> q_point;
+                  for (unsigned int d = 0; d < dim; ++d)
+                    q_point[d] = q_points[d][v];
+
+                  rhs_values[v] = rhs_function.value(q_point);
+                }
+              evaluator.submit_value(rhs_values, q);
+            }
+
+            evaluator.integrate_scatter(EvaluationFlags::values, dst);
+
+          }
+        } else if (is_intersected(cell_range_category))
+        {
+          const auto dofs_per_cell = evaluator.dofs_per_cell;
+
+          for (unsigned int cell_batch_index = cell_range.first;
+                cell_batch_index < cell_range.second;
+                ++cell_batch_index)
+            {
+              evaluator.reinit(cell_batch_index); 
+              // evaluator.read_dof_values(dst); // TODO: is this the best way to write into the global vector?
+              const VectorizedArrayType h = evaluator.read_cell_data(cell_diameter);
+
+              for (unsigned int v = 0;
+                  v < matrix_free->n_active_entries_per_cell_batch(
+                        cell_batch_index);
+                  ++v)
+                {
+                  const unsigned int cell_index = cell_batch_index * n_lanes + v; // TODO: this assumes filled lanes?
+                  // std::cout << "working on batch " << cell_batch_index << ", v = " << v << ", cell index " << cell_index << std::endl;
+
+                  evaluator_cell->reinit(cell_index); // mapping info for this cell known from instantiation
+                  // TODO: cell and surface eval in same loop possible?
+                  for (const auto q : evaluator_cell->quadrature_point_indices())
+                  {
+                    const auto q_points =  evaluator_cell->quadrature_point(q);
+
+                    VectorizedArrayType rhs_values = 0.;
+                    for (unsigned int vv = 0; vv< evaluator_cell->n_active_entries_per_quadrature_batch(q); ++vv)
+                    {
+                      Point<dim> q_point;
+                      for (unsigned int d = 0; d < dim; ++d)
+                      {
+                        q_point[d] = q_points[d][vv];
+                      }
+                      rhs_values[vv] = rhs_function.value(q_point);
+                    }
+                    evaluator_cell->submit_value(rhs_values, q); 
+                  }
+
+                  evaluator_surface->reinit(cell_index);
+                  for (const auto q : evaluator_surface->quadrature_point_indices())
+                  {
+                    const auto q_points =  evaluator_surface->quadrature_point(q);
+
+                    VectorizedArrayType dbc_values = 0.;
+                    for (unsigned int vv = 0; vv< evaluator_surface->n_active_entries_per_quadrature_batch(q); ++vv)
+                    {
+                      Point<dim> q_point;
+                      for (unsigned int d = 0; d < dim; ++d)
+                      {
+                        q_point[d] = q_points[d][vv];
+                      }
+                      dbc_values[vv] = boundary_condition.value(q_point);
+                    }
+                    evaluator_surface->submit_value(1000.0/h[v]*dbc_values, q); 
+                    evaluator_surface->submit_normal_derivative(-dbc_values, q);
+                  }
+                  const StridedArrayView<Number, n_lanes> output_dof_view(&evaluator.begin_dof_values()[0][v], dofs_per_cell);
+                  evaluator_cell->integrate(output_dof_view, EvaluationFlags::values, false);
+                  evaluator_surface->integrate(output_dof_view, EvaluationFlags::values | EvaluationFlags::gradients, true);
+
+                }
+              evaluator.distribute_local_to_global(dst);
+            }
+        } else {
+          // TODO: outside, no dofs here
+        }
+      
+      };
+
+      matrix_free->cell_loop(cell_op, rhs, rhs, true); // TODO: using rhs as dummy, zero?
     }
 
   private:
@@ -171,6 +289,74 @@ namespace Step95
       const std::pair<unsigned int, unsigned int> &cell_range) const
     {
       // TODO
+      const auto cell_range_category = matrix_free->get_cell_range_category(cell_range);
+      // std::cout << "local apply cell; type: " << cell_range_category << "; range: " << cell_range.first << ", " << cell_range.second << std::endl;
+
+      CellIntegrator evaluator(*matrix_free, dof_index, quad_index); 
+
+      if (is_inside(cell_range_category))
+      {
+          for (unsigned int cell_batch_index = cell_range.first;
+              cell_batch_index < cell_range.second;
+              ++cell_batch_index)
+          {
+            evaluator.reinit(cell_batch_index);
+            evaluator.gather_evaluate(src, EvaluationFlags::gradients);
+
+            for (unsigned int q : evaluator.quadrature_point_indices())
+              evaluator.submit_gradient(evaluator.get_gradient(q), q);
+
+            evaluator.integrate_scatter(EvaluationFlags::gradients, dst);
+          }
+
+      } else if(is_intersected(cell_range_category))
+      {
+        const auto dofs_per_cell = evaluator.dofs_per_cell;
+
+        for (unsigned int cell_batch_index = cell_range.first;
+              cell_batch_index < cell_range.second;
+              ++cell_batch_index)
+          {
+            evaluator.reinit(cell_batch_index);
+            evaluator.read_dof_values(src);
+            const VectorizedArrayType h = evaluator.read_cell_data(cell_diameter);
+
+            for (unsigned int v = 0;
+                  v < n_lanes;++v)
+              {
+
+                const unsigned int cell_index = cell_batch_index * n_lanes + v; // TODO: this assumes filled lanes?
+                const StridedArrayView<const Number, n_lanes> read_local_dof_view(&evaluator.begin_dof_values()[0][v], dofs_per_cell);
+                const StridedArrayView<Number, n_lanes> write_local_dof_view(&evaluator.begin_dof_values()[0][v], dofs_per_cell);
+
+                evaluator_cell->reinit(cell_index); // mapping info for this cell known from instantiation
+                evaluator_cell->evaluate(read_local_dof_view, EvaluationFlags::gradients); 
+                evaluator_surface->reinit(cell_index);
+                evaluator_surface->evaluate(read_local_dof_view, EvaluationFlags::values | EvaluationFlags::gradients); 
+
+                for (const auto q : evaluator_cell->quadrature_point_indices())
+                  {
+                    evaluator_cell->submit_gradient(evaluator_cell->get_gradient(q), q); // (\nabla \varphi, \nabla u)
+                  }
+                evaluator_cell->integrate(write_local_dof_view, EvaluationFlags::gradients, false); // TODO: local_dof_view ok, or am i overwriting src vector?, sum?
+                
+                for (const auto q : evaluator_surface->quadrature_point_indices())
+                  {
+                    // WIP: Nitsche terms
+                    const VectorizedArrayType value_q = evaluator_surface->get_value(q);
+                    const VectorizedArrayType dn_q = evaluator_surface->get_normal_derivative(q);
+                    evaluator_surface->submit_normal_derivative(-value_q, q); // -(\nabla \varphi \dot \vec{n}, u)
+                    evaluator_surface->submit_value(-(dn_q - 1.0/h[v] * value_q), q); // -(\varphi, \nabla u \cdot \vec{n} - \tau_\mathrm{D}/h u)
+                  }
+                evaluator_surface->integrate(write_local_dof_view, EvaluationFlags::gradients | EvaluationFlags::values, true);
+              }
+            evaluator.distribute_local_to_global(dst);
+          }
+      } else
+      {
+        // outside cell
+      }
+
     }
 
     void local_apply_face(
@@ -180,6 +366,26 @@ namespace Step95
       const std::pair<unsigned int, unsigned int> &face_range) const
     {
       // TODO
+      const auto face_range_category = matrix_free->get_face_range_category(face_range);
+      // std::cout << "local apply face; type: " << face_range_category.first << "," << face_range_category.second << "; range: " << face_range.first << ", " << face_range.second << std::endl;
+
+      if (is_inside_face(face_range_category))
+      {
+        // std::cout << "inside face" << std::endl;
+        // do nothing for cg
+        if (is_dg)
+        {
+          // TODO: fluxes
+        }
+      } else if(is_mixed_face(face_range_category))
+      {
+        // std::cout << "mixed" << std::endl;
+        // TODO: fluxes, but reduced integration interval
+      } else
+      {
+        // std::cout << "other category: " << face_range_category.first << "," << face_range_category.second << std::endl;
+      }
+
     }
 
     void local_apply_boundary_face(
@@ -189,6 +395,9 @@ namespace Step95
       const std::pair<unsigned int, unsigned int> &face_range) const
     {
       // TODO
+      const auto face_range_category = matrix_free->get_face_range_category(face_range);
+      // std::cout << "local apply boundary face; type: "  << face_range_category.first << "," << face_range_category.second << "; range: " << face_range.first << ", " << face_range.second << std::endl;
+      // TODO: no terms if all DBC on level-set
     }
 
     inline bool
@@ -370,7 +579,7 @@ namespace Step95
   PoissonSolver<dim>::PoissonSolver()
     : fe_degree(1)
     , rhs_function(4.0)
-    , boundary_condition(1.0)
+    , boundary_condition(0.0)
     , triangulation(MPI_COMM_WORLD)
     , pcout(std::cout,
             Utilities::MPI::this_mpi_process(
@@ -769,10 +978,9 @@ namespace Step95
           unsigned int &,
           const VectorType                            &src,
           const std::pair<unsigned int, unsigned int> &cell_range) {
-        CellIntegrator evaluator(matrix_free, dof_index, quad_index);
 
-        GenericCellIntegrator evaluator_cell(
-          *mapping_info_cell, matrix_free.get_dof_handler(dof_index).get_fe(0));
+        CellIntegrator evaluator(matrix_free, dof_index, quad_index); 
+        GenericCellIntegrator evaluator_cell(*mapping_info_cell, matrix_free.get_dof_handler(dof_index).get_fe(0));
 
         const auto cell_range_category =
           matrix_free.get_cell_range_category(cell_range);
@@ -853,7 +1061,7 @@ namespace Step95
   {
     dealii::Timer      timer;
     ConvergenceTable   convergence_table;
-    const unsigned int n_refinements = 3;
+    const unsigned int n_refinements = 0;
 
     make_grid();
     for (unsigned int cycle = 0; cycle <= n_refinements; cycle++)
@@ -899,7 +1107,9 @@ namespace Step95
         matrix_free.initialize_dof_vector(solution);
         matrix_free.initialize_dof_vector(rhs);
 
-        poisson_operator.rhs(rhs, rhs_function);
+        poisson_operator.rhs(rhs, rhs_function, boundary_condition);
+
+        pcout << "||RHS||^2 = " << rhs.norm_sqr() << std::endl;
 
         solve();
         if (cycle == 3)
@@ -934,7 +1144,7 @@ int main(int argc, char **argv)
 {
   dealii::Utilities::MPI::MPI_InitFinalize mpi(argc, argv, 1);
 
-  constexpr int dim = 3;
+  constexpr int dim = 2;
 
   Step95::PoissonSolver<dim> poisson_solver;
   poisson_solver.run();
