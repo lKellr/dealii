@@ -23,6 +23,9 @@ set(TARGET_SRC
 
 cmake_minimum_required(VERSION 3.13.4)
 
+SET(CMAKE_CXX_STANDARD 17)
+SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wno-unused-parameter")
+
 find_package(deal.II 9.7.0
   HINTS ${deal.II_DIR} ${DEAL_II_DIR} ../ ../../ $ENV{DEAL_II_DIR}
   )
